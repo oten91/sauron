@@ -17,6 +17,7 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/encoding"
@@ -122,26 +123,49 @@ func (p *GRPCProxy) GetServer() *grpc.Server {
 	return server
 }
 
+// isConnUsable reports whether a pooled gRPC connection can still carry requests.
+// READY/IDLE/CONNECTING are healthy or recoverable; TRANSIENT_FAILURE and SHUTDOWN
+// mean the channel is stuck — commonly a dead/black-holed backend, or one whose pod
+// was rescheduled to a new IP. Because the dial target uses the passthrough:///
+// resolver, gRPC never re-resolves a live channel, so a stuck one must be rebuilt to
+// pick up the current DNS result instead of being reused forever.
+func isConnUsable(conn *grpc.ClientConn) bool {
+	switch conn.GetState() {
+	case connectivity.Ready, connectivity.Idle, connectivity.Connecting:
+		return true
+	default: // TransientFailure, Shutdown
+		return false
+	}
+}
+
 // getOrCreateConnection gets a pooled connection or creates a new one (optimization)
 func (p *GRPCProxy) getOrCreateConnection(targetAddr string, useInsecure bool) (*grpc.ClientConn, error) {
-	// Check if we have a cached connection
+	// Check if we have a cached, still-usable connection
 	p.connMu.RLock()
 	if conn, exists := p.connPool[targetAddr]; exists {
-		// Verify connection is still valid
-		if conn.GetState().String() != "SHUTDOWN" {
+		if isConnUsable(conn) {
 			p.connMu.RUnlock()
 			return conn, nil
 		}
 	}
 	p.connMu.RUnlock()
 
-	// Need to create new connection
+	// Need to create (or rebuild) the connection
 	p.connMu.Lock()
 	defer p.connMu.Unlock()
 
 	// Double-check after acquiring write lock
-	if conn, exists := p.connPool[targetAddr]; exists && conn.GetState().String() != "SHUTDOWN" {
-		return conn, nil
+	if conn, exists := p.connPool[targetAddr]; exists {
+		if isConnUsable(conn) {
+			return conn, nil
+		}
+		// Stuck channel (TRANSIENT_FAILURE/SHUTDOWN) — tear it down and rebuild so the
+		// new connection re-resolves DNS. In-flight RPCs on it are already failing.
+		_ = conn.Close()
+		delete(p.connPool, targetAddr)
+		p.logger.Info("Rebuilding stuck gRPC connection",
+			zap.String("target", targetAddr),
+		)
 	}
 
 	// Create new connection with optimized settings

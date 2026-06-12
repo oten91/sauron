@@ -310,6 +310,33 @@ func normalizeURL(url string) string {
 	return url
 }
 
+// HasRoutableNode reports whether at least one backend is currently routable for the
+// given network and endpoint type: a non-stale internal node at a real height, or a
+// validated external endpoint. It is side-effect free (no round-robin advance, no
+// metrics) so it is safe to call from readiness probes. Used so a wedged replica that
+// has lost contact with all its backends reports NotReady and is pulled from the LB.
+func (s *Selector) HasRoutableNode(network, endpointType string) bool {
+	cfg := s.configLoader.Get()
+	staleThreshold := cfg.Timeouts.NodeStale
+	if staleThreshold <= 0 {
+		staleThreshold = defaultNodeStaleThreshold
+	}
+
+	for _, m := range s.store.GetByNetwork(network, endpointType) {
+		if m.Height > 0 && time.Since(m.Timestamp) <= staleThreshold {
+			return true
+		}
+	}
+
+	if s.endpointStore != nil {
+		if len(s.endpointStore.GetValidatedEndpoints(network, endpointType)) > 0 {
+			return true
+		}
+	}
+
+	return false
+}
+
 // GetHighestHeights returns the highest height for each enabled endpoint type
 // Used by the status API
 func (s *Selector) GetHighestHeights(network string, enabledTypes []string) map[string]int64 {

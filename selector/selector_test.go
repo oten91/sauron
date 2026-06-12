@@ -855,3 +855,37 @@ func TestSelectorAllStaleFallsBackToNoNodes(t *testing.T) {
 			nodeName, m, decision)
 	}
 }
+
+// TestHasRoutableNode covers the readiness signal: a replica is routable only when it
+// has a fresh internal node or a validated external endpoint.
+func TestHasRoutableNode(t *testing.T) {
+	logger := zap.NewNop()
+	heightStore := storage.NewHeightStore()
+	endpointStore := storage.NewExternalEndpointStore(logger)
+	configLoader := createTestConfigWithStale(t, 2, "60ms")
+	sel := NewSelector(heightStore, endpointStore, configLoader, logger)
+
+	// No data yet -> not routable.
+	if sel.HasRoutableNode("pocket", "api") {
+		t.Fatal("expected not routable with no node data")
+	}
+
+	// Fresh node at a real height -> routable.
+	heightStore.Update("pocket", "node-1", "api", 100, 10*time.Millisecond, "internal")
+	if !sel.HasRoutableNode("pocket", "api") {
+		t.Fatal("expected routable with a fresh node")
+	}
+
+	// Let the only node go stale -> not routable.
+	time.Sleep(80 * time.Millisecond)
+	if sel.HasRoutableNode("pocket", "api") {
+		t.Fatal("expected not routable once the only node is stale")
+	}
+
+	// A validated external endpoint makes it routable again.
+	endpointStore.StoreAdvertised("ext-1", "https://ring1.example.com", "pocket", "api", "https://ext1.example.com")
+	endpointStore.MarkValidated("ext-1", "https://ring1.example.com", "pocket", "api", "https://ext1.example.com", 100, 20*time.Millisecond)
+	if !sel.HasRoutableNode("pocket", "api") {
+		t.Fatal("expected routable via validated external endpoint")
+	}
+}

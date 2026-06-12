@@ -247,20 +247,42 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("OK"))
 }
 
-// handleReady returns 200 if height checks are working
+// handleReady returns 200 only if this replica can actually route to at least one
+// backend (a non-stale node or a validated external) for some enabled type. This is
+// stricter than "nodes are configured": a replica that has lost contact with all of
+// its backends (e.g. a black-holed/wedged pod) reports NotReady and is pulled from
+// the Service/LB, instead of silently absorbing traffic it cannot serve.
+//
+// Note: liveness (/health) stays unconditionally 200, so a NotReady replica is only
+// removed from rotation, never killed, and rejoins automatically once a backend
+// becomes reachable again. Trade-off: during a TOTAL backend outage every replica
+// reports NotReady, so the LB may have no endpoints; that is acceptable since none
+// can serve, but operators should be aware.
 func (h *Handler) handleReady(w http.ResponseWriter, r *http.Request) {
-	// Simple readiness check: are we tracking any heights?
 	cfg := h.configLoader.Get()
-	if len(cfg.Internals) == 0 {
-		http.Error(w, "Service not ready: no internal nodes configured", http.StatusServiceUnavailable)
-		h.logger.Warn("Readiness check failed: no internal nodes",
+	if len(cfg.Internals) == 0 && len(cfg.Externals) == 0 {
+		http.Error(w, "Service not ready: no backends configured", http.StatusServiceUnavailable)
+		h.logger.Warn("Readiness check failed: no backends configured",
 			zap.String("request_id", getRequestID(r)),
 		)
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("Ready"))
+	enabledTypes := cfg.GetEnabledTypes()
+	for _, network := range cfg.Networks {
+		for _, endpointType := range enabledTypes {
+			if h.selector.HasRoutableNode(network.Name, endpointType) {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("Ready"))
+				return
+			}
+		}
+	}
+
+	http.Error(w, "Service not ready: no routable backend", http.StatusServiceUnavailable)
+	h.logger.Warn("Readiness check failed: no routable backend",
+		zap.String("request_id", getRequestID(r)),
+	)
 }
 
 // getRequestID extracts the request ID from context

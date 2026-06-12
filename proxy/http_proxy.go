@@ -43,6 +43,14 @@ func NewHTTPProxy(
 ) *HTTPProxy {
 	// Optimized transport for maximum throughput
 	transport := &http.Transport{
+		// Bound the TCP connect. Without an explicit DialContext a hand-built
+		// Transport uses a zero-value dialer (no timeout), so a dial to a
+		// black-holed backend hangs at the OS level (~127s of SYN retries) before
+		// failing. A short cap lets a dead-but-still-selected backend fail fast.
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   100,
 		MaxConnsPerHost:       0, // Unlimited
