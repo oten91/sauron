@@ -28,6 +28,12 @@ type Config struct {
 type Timeouts struct {
 	HealthCheck time.Duration `mapstructure:"health_check"`
 	Proxy       time.Duration `mapstructure:"proxy"`
+	// NodeStale is the maximum age of a node's last SUCCESSFUL health check before
+	// it is excluded from the routing pool. A black-holed/hung backend stops being
+	// updated, so its stored height freezes; this threshold ensures such a node is
+	// treated as unavailable instead of staying a routing candidate at a stale height.
+	// Should be >= 2x the health-check interval to avoid flapping. Default: 90s.
+	NodeStale time.Duration `mapstructure:"node_stale"`
 }
 
 // Redis configuration (optional distributed cache)

@@ -719,3 +719,139 @@ func TestSelectorNoInternalsOnlyExternals(t *testing.T) {
 		t.Errorf("Expected 1 candidate, got %d", decision.Candidates)
 	}
 }
+
+// createTestConfigWithStale builds a config loader with an explicit node_stale
+// threshold so staleness gating can be exercised with short, deterministic timings.
+func createTestConfigWithStale(t *testing.T, threshold int64, nodeStale string) *config.Loader {
+	t.Helper()
+
+	configContent := `
+api: true
+rpc: true
+grpc: true
+listen: ":3000"
+external_failover_threshold: ` + itoa(threshold) + `
+
+timeouts:
+  health_check: 5s
+  proxy: 60s
+  node_stale: ` + nodeStale + `
+
+networks:
+  - name: "pocket"
+    api_listen: ":8080"
+    rpc_listen: ":8081"
+    grpc_listen: ":8082"
+
+internals:
+  - name: node-1
+    api: "https://node1.example.com"
+    rpc: "https://node1.example.com:26657"
+    grpc: "node1.example.com:9090"
+    network: "pocket"
+  - name: node-2
+    api: "https://node2.example.com"
+    rpc: "https://node2.example.com:26657"
+    grpc: "node2.example.com:9090"
+    network: "pocket"
+`
+	tmpFile, err := os.CreateTemp("", "sauron-stale-test-*.yaml")
+	if err != nil {
+		t.Fatalf("Failed to create temp config file: %v", err)
+	}
+	if _, err := tmpFile.WriteString(configContent); err != nil {
+		t.Fatalf("Failed to write temp config: %v", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		t.Fatalf("Failed to close temp config file: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(tmpFile.Name()) })
+
+	loader, err := config.NewLoader(tmpFile.Name(), zap.NewNop())
+	if err != nil {
+		t.Fatalf("Failed to create config loader: %v", err)
+	}
+	return loader
+}
+
+// TestSelectorExcludesStaleNodes is the regression test for the production
+// unhealthy-routing incident: a backend that black-holes stops being updated by
+// the health checker, so its stored height freezes and is never invalidated.
+// Routing is height-based with no availability field, so without staleness gating
+// the frozen node stays a candidate and requests get dispatched into the dead node.
+// The selector must exclude a node whose last successful check is older than the
+// configured threshold, and must let it back in once checks resume (self-healing).
+func TestSelectorExcludesStaleNodes(t *testing.T) {
+	logger := zap.NewNop()
+	heightStore := storage.NewHeightStore()
+	endpointStore := storage.NewExternalEndpointStore(logger)
+	configLoader := createTestConfigWithStale(t, 2, "60ms")
+
+	// Both nodes start fresh and at the same height.
+	heightStore.Update("pocket", "node-1", "api", 100, 10*time.Millisecond, "internal")
+	heightStore.Update("pocket", "node-2", "api", 100, 10*time.Millisecond, "internal")
+
+	sel := NewSelector(heightStore, endpointStore, configLoader, logger)
+
+	// Age both nodes past the staleness threshold. node-2 is never refreshed again,
+	// simulating the black-holed backend with a frozen height.
+	time.Sleep(80 * time.Millisecond)
+
+	// While node-2 stays stale, node-1 keeps getting refreshed (healthy checks).
+	// Every selection must pick node-1; node-2 must never be a candidate.
+	for i := 0; i < 20; i++ {
+		heightStore.Update("pocket", "node-1", "api", 100, 10*time.Millisecond, "internal")
+
+		m, nodeName, decision := sel.GetBestNode("pocket", "api")
+		if nodeName != "node-1" {
+			t.Fatalf("iteration %d: stale node-2 should be excluded; got %q (reason=%s, candidates=%d)",
+				i, nodeName, decision.Reason, decision.Candidates)
+		}
+		if m == nil {
+			t.Fatalf("iteration %d: expected metrics for node-1, got nil", i)
+		}
+		if decision.Candidates != 1 {
+			t.Fatalf("iteration %d: expected only node-1 considered, got %d candidates", i, decision.Candidates)
+		}
+	}
+
+	// Self-healing: once node-2's checks resume, it must rejoin the pool and start
+	// receiving round-robin traffic again.
+	heightStore.Update("pocket", "node-2", "api", 100, 10*time.Millisecond, "internal")
+	sawNode2 := false
+	for i := 0; i < 20; i++ {
+		heightStore.Update("pocket", "node-1", "api", 100, 10*time.Millisecond, "internal")
+		heightStore.Update("pocket", "node-2", "api", 100, 10*time.Millisecond, "internal")
+		if _, nodeName, _ := sel.GetBestNode("pocket", "api"); nodeName == "node-2" {
+			sawNode2 = true
+			break
+		}
+	}
+	if !sawNode2 {
+		t.Fatal("recovered node-2 was never selected; staleness gate did not self-heal")
+	}
+}
+
+// TestSelectorAllStaleFallsBackToNoNodes verifies that when every internal node is
+// stale (e.g. all backends black-holed), the selector reports no routable node
+// rather than dispatching into a dead one.
+func TestSelectorAllStaleFallsBackToNoNodes(t *testing.T) {
+	logger := zap.NewNop()
+	heightStore := storage.NewHeightStore()
+	endpointStore := storage.NewExternalEndpointStore(logger)
+	configLoader := createTestConfigWithStale(t, 2, "40ms")
+
+	heightStore.Update("pocket", "node-1", "api", 100, 10*time.Millisecond, "internal")
+	heightStore.Update("pocket", "node-2", "api", 100, 10*time.Millisecond, "internal")
+
+	sel := NewSelector(heightStore, endpointStore, configLoader, logger)
+
+	// Let both nodes age past the threshold and never refresh.
+	time.Sleep(70 * time.Millisecond)
+
+	m, nodeName, decision := sel.GetBestNode("pocket", "api")
+	if m != nil || nodeName != "" || decision != nil {
+		t.Fatalf("expected no routable node when all are stale, got node=%q metrics=%v decision=%v",
+			nodeName, m, decision)
+	}
+}

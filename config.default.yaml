@@ -22,6 +22,10 @@ external_failover_threshold: 2
 timeouts:
   health_check: 5s  # How often to check node health
   proxy: 60s        # Timeout for proxied requests
+  node_stale: 90s   # Exclude a node from routing if its last successful health check
+                    # is older than this. Guards against a hung/black-holed backend
+                    # whose stored height freezes and would otherwise stay selectable.
+                    # Keep >= 2x the health-check interval to avoid flapping. Default: 90s.
 
 # Rate limiting for status API (optional)
 rate_limit:

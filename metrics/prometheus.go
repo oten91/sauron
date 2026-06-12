@@ -123,6 +123,17 @@ var (
 		[]string{"network", "type"},
 	)
 
+	// NodeStaleExclusions counts how often a node was excluded from routing because
+	// its last successful health check was older than the staleness threshold (i.e.
+	// a timed-out/black-holed backend whose stored height had frozen).
+	NodeStaleExclusions = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sauron_node_stale_exclusions_total",
+			Help: "Total times a node was excluded from routing due to a stale health check",
+		},
+		[]string{"network", "node", "type"},
+	)
+
 	// Proxy Performance Metrics
 
 	// ProxyRequestDuration tracks end-to-end proxy request duration

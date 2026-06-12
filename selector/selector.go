@@ -21,6 +21,12 @@ type Selector struct {
 	rrCounter     uint64 // Round-robin counter for load distribution
 }
 
+// defaultNodeStaleThreshold is the fallback maximum age of a node's last
+// successful health check before it is excluded from routing, used when
+// Timeouts.NodeStale is not configured. Kept well above the 30s health-check
+// interval so a single missed cycle does not evict a healthy node.
+const defaultNodeStaleThreshold = 90 * time.Second
+
 // SelectionDecision tracks why a node was selected
 type SelectionDecision struct {
 	SelectedNode    string
@@ -43,6 +49,8 @@ func NewSelector(store *storage.HeightStore, endpointStore *storage.ExternalEndp
 // GetBestNode returns the best node for the given network and endpoint type
 // The Eye sees all, the Dark Lord judges
 func (s *Selector) GetBestNode(network, endpointType string) (*storage.NodeMetrics, string, *SelectionDecision) {
+	cfg := s.configLoader.Get()
+
 	// Get all internal nodes for this network and type
 	nodesMap := s.store.GetByNetwork(network, endpointType)
 
@@ -52,8 +60,32 @@ func (s *Selector) GetBestNode(network, endpointType string) (*storage.NodeMetri
 		metrics *storage.NodeMetrics
 	}
 
+	// Staleness threshold: a node's height is only refreshed on a SUCCESSFUL health
+	// check, so a black-holed/hung backend stops being updated and its stored height
+	// freezes. Nothing else invalidates that height, so without this gate the frozen
+	// value stays a routing candidate and requests get dispatched into the dead node.
+	staleThreshold := cfg.Timeouts.NodeStale
+	if staleThreshold <= 0 {
+		staleThreshold = defaultNodeStaleThreshold
+	}
+
 	nodes := make([]nodeWithName, 0, len(nodesMap))
 	for name, m := range nodesMap {
+		// Exclude nodes whose last successful check is too old (or that were never
+		// successfully checked, leaving a zero timestamp). This is what makes
+		// "unavailable" actually mean "not routed to".
+		if age := time.Since(m.Timestamp); age > staleThreshold {
+			metrics.NodeStaleExclusions.WithLabelValues(network, name, endpointType).Inc()
+			s.logger.Debug("Selector: excluding stale node",
+				zap.String("network", network),
+				zap.String("type", endpointType),
+				zap.String("node", name),
+				zap.Duration("age", age),
+				zap.Duration("threshold", staleThreshold),
+				zap.Int64("frozen_height", m.Height),
+			)
+			continue
+		}
 		nodes = append(nodes, nodeWithName{name: name, metrics: m})
 	}
 
@@ -77,7 +109,6 @@ func (s *Selector) GetBestNode(network, endpointType string) (*storage.NodeMetri
 		externalEndpoints := s.endpointStore.GetValidatedEndpoints(network, endpointType)
 
 		// Get threshold from config (default to 2 blocks)
-		cfg := s.configLoader.Get()
 		threshold := cfg.ExternalFailoverThreshold
 		if threshold == 0 {
 			threshold = 2 // default threshold
