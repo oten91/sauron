@@ -62,11 +62,17 @@ func NewHTTPProxy(
 	}
 }
 
-// isWebSocketRequest checks if this is a WebSocket upgrade request
+// isWebSocketRequest checks if this is a WebSocket upgrade request.
+// Detects via standard Upgrade headers or the /websocket path (CometBFT convention),
+// since reverse proxies like HAProxy may strip hop-by-hop headers (Connection, Upgrade).
 func isWebSocketRequest(r *http.Request) bool {
 	connection := strings.ToLower(r.Header.Get("Connection"))
 	upgrade := strings.ToLower(r.Header.Get("Upgrade"))
-	return strings.Contains(connection, "upgrade") && upgrade == "websocket"
+	if strings.Contains(connection, "upgrade") && upgrade == "websocket" {
+		return true
+	}
+	// Fallback: detect by path when headers are stripped by upstream proxy
+	return r.URL.Path == "/websocket"
 }
 
 // ServeHTTP handles the proxy request
@@ -130,7 +136,7 @@ func (p *HTTPProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Handle WebSocket upgrade requests separately
 	if isWebSocketRequest(r) {
-		p.handleWebSocket(w, r, target, nodeName, network, start, decision)
+		p.handleWebSocket(w, r, target, nodeMetrics, nodeName, network, start, decision)
 		return
 	}
 
@@ -243,22 +249,24 @@ func (rt *responseTracker) Write(b []byte) (int, error) {
 }
 
 // handleWebSocket handles WebSocket proxy requests
-func (p *HTTPProxy) handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL, nodeName, network string, start time.Time, decision *selector.SelectionDecision) {
+func (p *HTTPProxy) handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL, nodeMetrics *storage.NodeMetrics, nodeName, network string, start time.Time, decision *selector.SelectionDecision) {
 	p.logger.Info("Handling WebSocket upgrade",
 		zap.String("target_host", target.Host),
 		zap.String("target_scheme", target.Scheme),
 		zap.String("path", r.URL.Path),
 	)
 
-	// Check if the selected node supports WebSocket
-	nodeMetrics, selectedNode, _ := p.selector.GetBestNode(network, p.endpointType)
+	// Check if the selected node supports WebSocket.
+	// Use the metrics for the node already chosen in ServeHTTP — calling GetBestNode
+	// again here would re-run round-robin and could check a different node than the
+	// one whose target we are about to dial.
 	if nodeMetrics != nil && !nodeMetrics.WebSocketAvailable {
 		p.logger.Warn("Selected node does not support WebSocket",
-			zap.String("node", selectedNode),
+			zap.String("node", nodeName),
 			zap.String("network", network),
 		)
 		http.Error(w, "WebSocket not supported by selected backend", http.StatusServiceUnavailable)
-		metrics.ProxyErrors.WithLabelValues(network, selectedNode, p.endpointType, "503", "websocket_not_supported").Inc()
+		metrics.ProxyErrors.WithLabelValues(network, nodeName, p.endpointType, "503", "websocket_not_supported").Inc()
 		return
 	}
 
@@ -327,6 +335,14 @@ func (p *HTTPProxy) handleWebSocket(w http.ResponseWriter, r *http.Request, targ
 	// Update the Host header to match the backend
 	r.Host = target.Host
 	r.Header.Set("Host", target.Host)
+
+	// Ensure WebSocket upgrade headers are present (may have been stripped by upstream proxy)
+	if !strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade") {
+		r.Header.Set("Connection", "Upgrade")
+	}
+	if strings.ToLower(r.Header.Get("Upgrade")) != "websocket" {
+		r.Header.Set("Upgrade", "websocket")
+	}
 
 	// Forward the upgrade request to backend
 	err = r.Write(backendConn)
